@@ -1,202 +1,141 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 import os
 
-# --- CONFIGURATION & DATABASE SETUP ---
-DB_FILE = "voter_data.db"
+# --- Configuration ---
+st.set_page_config(
+    page_title="Voter List Search",
+    layout="wide"
+)
 
-# Map the CSV headers (on the right) to the database column names (on the left)
-CSV_COLUMNS_TO_READ = {
-    'part_serial_number_raw': 'Serial No.',             
-    'name': 'Name',
-    'ward_house_raw': 'OldWard No/ House No.',        
-    'house_name': 'House Name',  # <--- NEW MAPPING
-    'gender_age_raw': 'Gender / Age',                  
-    'sec_id': 'New SEC ID No.'
-}
+# Define the list of all CSV files and their location
+CSV_FILES = [
+    "voter_lists/1_Pappad.csv",
+    "voter_lists/2_Manchampara_Marathakam.csv",
+    "voter_lists/3_Manchampara_Manikyam.csv",
+    "voter_lists/4_Communityhall_Rightside.csv",
+    "voter_lists/5_Communityhall_Leftside.csv",
+    "voter_lists/6_CPT.csv",
+    "voter_lists/7_Depaul.csv",
+]
 
-def init_db():
-    """Initialize the SQLite database with the required schema."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS voters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sec_id TEXT UNIQUE,
-            part_serial_number TEXT,
-            ward TEXT,
-            polling_station TEXT,
-            name TEXT,
-            gender TEXT,
-            age INTEGER,
-            house_name TEXT,  -- <--- NEW COLUMN IN DB
-            source_file TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# --- Data Loading and Cleaning ---
 
+@st.cache_data
+def load_and_clean_data():
+    """Loads, combines, and cleans all voter data from CSV files."""
+    all_data = []
 
-def process_csv_file(uploaded_file):
-    """
-    Reads data from a CSV file, performs necessary transformations, 
-    and prepares it for database insertion.
-    """
+    # Check for the data directory
+    if not os.path.exists("voter_lists"):
+        st.error("Error: The 'voter_lists' directory was not found. Please create it and place the CSV files inside.")
+        return pd.DataFrame()
+
+    # Load each file
+    for file_path in CSV_FILES:
+        try:
+            # Reading with default index_col=False and standard encoding
+            df = pd.read_csv(file_path, encoding='utf-8')
+            all_data.append(df)
+        except FileNotFoundError:
+            st.warning(f"File not found: {file_path}. Skipping this list.")
+        except Exception as e:
+            st.error(f"Error loading {file_path}: {e}")
+
+    # Combine all dataframes
+    if not all_data:
+        st.error("No voter data could be loaded. Please check your files.")
+        return pd.DataFrame()
+
+    voter_data = pd.concat(all_data, ignore_index=True)
+
+    # Clean the combined data
+    
+    # 1. Drop completely empty columns (like the extra ones at the end of your file snippets)
+    voter_data.dropna(axis=1, how='all', inplace=True)
+    
+    # 2. Rename columns to ensure consistency and correct capitalization
+    # We rely on the first 7 columns being the standard ones found in the snippets
     try:
-        # 1. Read the CSV file
-        df = pd.read_csv(uploaded_file, encoding='latin1')
-        
-        # 2. Rename columns for internal processing
-        df_clean = df.rename(columns={v: k for k, v in CSV_COLUMNS_TO_READ.items()})
-        
-        # 3. Data Extraction and Transformation
-        
-        # 3.1. Extract Polling Station Name from the filename
-        file_name = uploaded_file.name
-        polling_station_raw = file_name.rsplit('_', 1)[-1].rsplit('-', 1)[-1].replace('.csv', '')
-        df_clean['polling_station'] = polling_station_raw
+        voter_data.columns = [
+            'Serial No.', 
+            'Name', 
+            "Guardian's Name", 
+            'OldWard No/ House No.', 
+            'House Name', 
+            'Gender / Age', 
+            'New SEC ID No.'
+        ]
+    except ValueError:
+        st.error("Column mismatch detected. Please ensure all 7 CSV files have the expected 7 columns.")
+        return pd.DataFrame()
 
-        # 3.2. Split Gender / Age
-        df_clean[['gender', 'age_raw']] = df_clean['gender_age_raw'].astype(str).str.split(' / ', n=1, expand=True)
-        df_clean['gender'] = df_clean['gender'].str.upper().str.strip()
-        df_clean['age'] = pd.to_numeric(df_clean['age_raw'], errors='coerce').fillna(0).astype(int)
+    # 3. Split the 'Gender / Age' column
+    voter_data[['Gender', 'Age']] = voter_data['Gender / Age'].str.split(' / ', expand=True)
+    voter_data['Age'] = pd.to_numeric(voter_data['Age'], errors='coerce') # Convert Age to numeric
+    
+    # 4. Drop the original combined column
+    voter_data.drop(columns=['Gender / Age'], inplace=True)
+    
+    # Select and reorder final columns for display
+    final_columns = [
+        'Serial No.',
+        'Name', 
+        'Gender', 
+        'Age',
+        "Guardian's Name", 
+        'House Name',
+        'OldWard No/ House No.', 
+        'New SEC ID No.'
+    ]
+    
+    # Ensure all final columns exist before subsetting
+    # This guards against issues where certain files might have missing data/columns
+    cols_to_keep = [col for col in final_columns if col in voter_data.columns]
+    
+    return voter_data[cols_to_keep]
 
-        # 3.3. Extract Ward Number
-        df_clean['ward'] = df_clean['ward_house_raw'].astype(str).str.split('/', n=1, expand=True)[0]
-        
-        # 3.4. Finalize other columns
-        df_clean['part_serial_number'] = df_clean['part_serial_number_raw'].astype(str)
-        df_clean['sec_id'] = df_clean['sec_id'].astype(str).str.upper().str.strip()
-        df_clean['source_file'] = uploaded_file.name
-        
-        # 4. Select final required columns in DB order (House Name added here)
-        final_db_columns = [
-            'sec_id', 'part_serial_number', 'ward', 'polling_station', 
-            'name', 'gender', 'age', 'house_name', 'source_file' 
+# --- Main Streamlit App Logic ---
+
+st.title("Voter List Search Application 🔎")
+st.markdown("Search for a voter by **Name** in the compiled list of all 7 files.")
+
+# Load the data using the cached function
+df = load_and_clean_data()
+
+if not df.empty:
+    
+    # Sidebar status
+    st.sidebar.success(f"✅ Total Voters Loaded: {len(df):,}")
+    
+    # Search input
+    search_term = st.text_input("Enter Voter's Name to Search (case-insensitive):").strip()
+    
+    # Search button (optional, but good for performance on large datasets)
+    # if st.button("Search"):
+    
+    if search_term:
+        # Perform the search: filter rows where 'Name' contains the search term
+        # astype(str) handles potential NaN/non-string values in the 'Name' column
+        filtered_df = df[
+            df['Name'].astype(str).str.contains(search_term, case=False, na=False)
         ]
         
-        df_final = df_clean[final_db_columns]
-
-        # Convert DataFrame to a list of tuples for SQLite insertion
-        voters_list = [tuple(row) for row in df_final.itertuples(index=False)]
+        # Display results
+        st.subheader(f"Results for '{search_term}'")
+        st.info(f"Found **{len(filtered_df)}** result(s).")
         
-        return voters_list
-
-    except Exception as e:
-        st.error(f"Error processing {uploaded_file.name}. Please check the file's header names or data format.")
-        st.error(f"Details: {e}")
-        return []
-
-def save_to_db(voters):
-    """Saves a list of voter tuples to the database, ignoring duplicates by SEC ID."""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    # SQL query is updated to include 'house_name' and use 9 placeholders
-    insert_sql = f'''
-        INSERT OR IGNORE INTO voters 
-        (sec_id, part_serial_number, ward, polling_station, name, gender, age, house_name, source_file)
-        VALUES ({', '.join(['?'] * 9)})
-    '''
-    
-    try:
-        c.executemany(insert_sql, voters)
-        conn.commit()
-        count = c.rowcount
-    except sqlite3.Error as e:
-        st.error(f"Database error during insert: {e}")
-        count = 0
-    finally:
-        conn.close()
-    return count
-
-# --- SEARCH LOGIC ---
-def search_voter(query_type, query_value):
-    # This selects all columns, including the new 'house_name'
-    conn = sqlite3.connect(DB_FILE)
-    
-    if query_type == "By SEC ID":
-        df = pd.read_sql_query("SELECT * FROM voters WHERE sec_id = ?", conn, params=(query_value.upper(),))
-    else:
-        df = pd.read_sql_query("SELECT * FROM voters WHERE name LIKE ?", conn, params=(f'%{query_value}%',))
-    
-    conn.close()
-    return df
-
-# --- USER INTERFACE (STREAMLIT) ---
-def main():
-    st.set_page_config(page_title="Voter Data Extractor", layout="wide")
-    st.title("🗳️ Voter List Search System")
-    st.subheader("Centralized Database for Polling Stations")
-
-    # Initialize DB (This will create the 'house_name' column if the DB file doesn't exist yet)
-    init_db()
-
-    # Create Tabs
-    tab1, tab2 = st.tabs(["📂 Upload/Manage Data", "🔍 Search Voter"])
-
-    # --- TAB 1: UPLOAD ---
-    with tab1:
-        st.header("Bulk Upload CSV Files")
-        st.warning("Upload your CSV files **one time** to build the master database.")
-        
-        uploaded_files = st.file_uploader("Choose your CSV files", type=["csv"], accept_multiple_files=True)
-        
-        if uploaded_files:
-            if st.button(f"Process {len(uploaded_files)} CSV Files and Load Database"):
-                total_new_records = 0
-                st.info("Starting batch processing...")
-                
-                for file in uploaded_files:
-                    voter_data = process_csv_file(file)
-                    if voter_data:
-                        inserted_count = save_to_db(voter_data)
-                        total_new_records += inserted_count
-                        st.success(f"File **{file.name}** processed: **{inserted_count}** new unique records added.")
-                    else:
-                        st.warning(f"File **{file.name}** processed, but no valid data could be inserted.")
-
-                st.balloons()
-                st.success(f"**Batch Complete!** Total new unique records added: **{total_new_records}**.")
-                
-        st.subheader("Database Status")
-        conn = sqlite3.connect(DB_FILE)
-        count_df = pd.read_sql_query("SELECT COUNT(*) AS Total_Records FROM voters", conn)
-        conn.close()
-        st.metric(label="Total Records in Database", value=count_df['Total_Records'].iloc[0])
-
-
-    # --- TAB 2: SEARCH ---
-    with tab2:
-        st.header("Search Database")
-        
-        col1, col2 = st.columns([1, 2])
-        with col1:
-            search_mode = st.radio("Search By:", ["By Name", "By SEC ID"])
-        with col2:
-            search_input = st.text_input("Enter Name or ID")
-            search_btn = st.button("Find Voter")
-
-        if search_btn and search_input:
-            results = search_voter(search_mode, search_input)
+        if not filtered_df.empty:
+            # Reset index for cleaner display in the table
+            st.dataframe(filtered_df.reset_index(drop=True), use_container_width=True)
+        else:
+            st.warning("No matching voters found. Try a broader search term.")
             
-            if not results.empty:
-                st.success(f"Found {len(results)} record(s).")
-                # Drop only the internal DB id and source file for clean display
-                display_results = results.drop(columns=['id', 'source_file'])
-                st.dataframe(display_results)
-                
-                # Download option
-                csv = display_results.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    "Download Results as CSV",
-                    csv,
-                    "search_results.csv",
-                    "text/csv",
-                    key='download-csv'
-                )
-            else:
-                st.warning(f"No records found matching '{search_input}'.")
+    else:
+        # Overview when no search is performed
+        st.subheader("Voter List Overview (Sample Data)")
+        st.dataframe(df.head(20), use_container_width=True)
+        st.caption(f"Showing a sample of the first 20 records out of {len(df):,} total.")
 
-if __name__ == "__main__":
-    main()
+else:
+    st.error("The application failed to load data. Please check the console for errors and verify your 'voter_lists' directory setup.")
